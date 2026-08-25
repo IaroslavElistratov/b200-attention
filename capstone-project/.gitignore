@@ -1,0 +1,67 @@
+# Repository-local environments and caches
+/.venv/
+/.cache/
+/.pytest_cache/
+/.ruff_cache/
+/.mypy_cache/
+**/__pycache__/
+*.py[cod]
+
+# Downloaded or generated runtime state
+/runtime/
+/vendor/
+/third_party/LTX-2/
+/models/
+/outputs/
+/build/
+/dist/
+*.egg-info/
+
+# Native build products
+*.a
+*.cubin
+*.fatbin
+*.o
+*.obj
+*.ptx
+*.so
+*.dylib
+*.dll
+build.ninja
+.ninja_deps
+.ninja_log
+
+# Model weights, tensors, and generated media
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+*.gguf
+*.bin
+*.mp4
+*.mov
+*.mkv
+*.webm
+
+# Logs and transient reports
+*.log
+/logs/
+
+# Credentials and local environment configuration
+.env
+.env.*
+!.env.example
+*.token
+*token*.txt
+/tokens/
+/credentials/
+credentials.json
+secrets.json
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+/.idea/
+/.vscode/
+*.swp
+*~

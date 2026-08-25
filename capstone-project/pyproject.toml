@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ltx-sm100"
+version = "0.1.0"
+description = "B200 attention kernel integration for the LTX-2.3 video pipeline"
+readme = "README.md"
+requires-python = "==3.12.*"
+license = { file = "LICENSE" }
+authors = [{ name = "LTX SM100 contributors" }]
+dependencies = [
+    "huggingface-hub==1.20.1",
+    "ltx-core",
+    "ltx-pipelines",
+    "ninja>=1.11,<2",
+    "torch==2.8.0",
+    "torchaudio==2.8.0",
+    "torchvision==0.23.0",
+    "transformers==5.12.1",
+]
+
+[project.scripts]
+ltx-sm100 = "ltx_sm100.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+    "ruff>=0.11,<0.12",
+]
+
+[tool.uv.sources]
+ltx-core = { path = "third_party/LTX-2/packages/ltx-core", editable = true }
+ltx-pipelines = { path = "third_party/LTX-2/packages/ltx-pipelines", editable = true }
+torch = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ltx_sm100"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+markers = [
+    "b200: requires an NVIDIA B200 and CUDA 12.8",
+    "e2e: runs the opt-in full LTX generation smoke test",
+    "models: requires downloaded LTX-2.3 and Gemma model files",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "UP"]
