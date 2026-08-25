@@ -29,7 +29,7 @@ __device__ __forceinline__ uint64_t desc_mnmajor(int smem_addr_bytes, int width)
 __device__ __forceinline__ void tma_load_kmajor(
     int dst_smem_base, const CUtensorMap* tmap, int tile_height, int global_row0, int mbar_addr) {
 
-  // better than hardcoding a global BLOCK_K, because what's block_k (int the traditional)
+  // better than hardcoding a global BLOCK_K, because what's block_k (in the traditional)
   // matmul notation changes depending on which mamtul we're in. Ie see (local-to-global mapping),
   // for QK k=HeadDim, for PV k=KV_row. Here's using HEAD_DIM because im only using this helper for QK matmul now
   //
@@ -48,10 +48,11 @@ __device__ __forceinline__ void tma_load_kmajor(
 __device__ __forceinline__ void tma_load_mnmajor(
     int dst_smem_base, const CUtensorMap* tmap, int global_row0, int mbar_addr) {
 
-  // this whole loop -- first takes the first horisontal slice, and iterates to the right (in 8x8 steps inside of it)
-  // Then goes to the second horisontal  slice, then inteartes inside of it to the right (in 8x8 steps inside of it), and so on
+  // in my logical view, this whole loop:
+  // takes the first horizontal slice, and iterates to the right (in 8x8 steps);
+  // then goes to the second horizontal  slice, then iterates inside of it to the
+  // right (in 8x8 steps), and so on
 
-  // answer-now:
   // For this helper, one TMA copy is one 8x8 bf16 tile:
   //    8 rows × 8 cols × 2 bytes = 128 bytes
   const int n8_stride = ATOM_ROWS * ATOM_COLS * BF16_BYTES;
