@@ -1,0 +1,1041 @@
+// Kernel 16 focus: split rowsum accumulation at the high96/low32 boundary.
+//   1. Accumulate cached high96 probabilities with one packed f32x2 chain.
+//   2. Fold the two lanes once when high96 P is published.
+//   3. Accumulate the reread low32 probabilities with the scalar rowsum chain.
+
+#include "common.cuh"
+#include "approximations.cuh"
+
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
+#include <cfloat>
+#include <cmath>
+
+// tcgen05 + TMA + TMEM attention with q_stage=2 + early-PV.
+//
+// Assumptions:
+//   - head_dim == 128
+//   - BLOCK_M == 128 queries per Q stage
+//   - BLOCK_N == 128 keys per KV tile
+//   - q_stage == 2, so each CTA covers 256 query rows
+//   - len_q % 256 == 0
+//   - len_kv % 128 == 0
+//   - dense, non-causal, no masking
+//   - inputs/outputs are bf16
+//
+// Steady-state dataflow:
+//   1) load warp loads Q0/Q1 for each work item and drives the unified KV[3] token stream
+//   2) MMA warp seeds S0/S1, then keeps the slot-owned schedule:
+//      after PVq(i), immediately write QKq(i+1) into that freed S/P slot
+//   3) softmax warps for stage0/stage1 independently consume S0/S1 and write packed P0/P1,
+//      producing high96 first, then low32
+//   4) correction warps rescale O0/O1 using the per-row rescale factors from softmax
+//   5) MMA warp waits until Pq high96 is ready and Oq is safe, starts PV on high96,
+//      then waits for full Pq and finishes PV on low32
+//   6) after the KV loop: softmax reads O from TMEM, normalizes by rowsum,
+//      and writes bf16 output directly to global memory
+//
+// The O dependency has two distinct handoffs:
+// correction needs the previous PV to finish writing O; the next PV needs correction
+// to finish rescaling O into the current softmax basis
+//
+// Correction consumes two barrier streams before rescaling O:
+//   1) stats_ready(q,i): current rescale_smem values are ready
+//   2) pv_done(q,i-1): direct O-ordering handoff and required observation
+//      of pv_done's reused phase
+
+namespace {
+
+constexpr int BLOCK_M = 128;
+constexpr int BLOCK_N = 128;
+constexpr int HEAD_DIM = 128;
+constexpr int MMA_K = 16;
+
+namespace q_stage {
+constexpr int STAGES = 2;
+constexpr int ROWS_PER_WORK_ITEM = STAGES * BLOCK_M;  // Q0 + Q1
+}  // namespace q_stage
+// S register caching: one tcgen05 x8 load returns 8 scores per softmax-warp lane
+// cache the high 12 x8 fragments (high96) and reread the low 4 (low32)
+constexpr int FIRST_CACHED_FRAGMENT = 4;   // fragments 0..3 are reread
+constexpr int NUM_CACHED_FRAGMENTS = 12;   // fragments 4..15 are cached
+// P is produced right-to-left to shorten cached-score register live ranges
+// so high96 P[:, 32:128] becomes ready before low32 P[:, 0:32]
+// early PV starts after high96 is stored
+constexpr int EARLY_PV_START_MICROSTEP = 2;           // 32/96 boundary: issue k=2..7, then k=0..1
+
+// rebase once the candidate rowmax is at least 8 log2 units above the old reference
+constexpr float ROWMAX_REBASE_THRESHOLD_LOG2 = 8.0f;
+// all 32 bits of UINT32_MAX are 1, so this mask later selects all 32 threads in a warp
+constexpr unsigned FULL_WARP_MASK = UINT32_MAX;
+
+// Warp roles:
+//   0..3   softmax q0, 32 rows per warp
+//   4..7   softmax q1, 32 rows per warp
+//   8..11  correction, 32 rows per warp; each handles q0 then q1
+//   12     TMA load
+//   13     tcgen05 MMA
+constexpr int SOFTMAX_WARPS_PER_STAGE = 4;  // fixed 128 rows, 32 rows per warp
+constexpr int SOFTMAX_WARP_COUNT = q_stage::STAGES * SOFTMAX_WARPS_PER_STAGE;
+constexpr int CORR_WARP_BASE = SOFTMAX_WARP_COUNT;  // correction starts after all softmax warps
+constexpr int CORR_WARP_COUNT = 4;  // fixed 128 rows, 32 rows per warp; shared across q0 and q1 (unlike softmax warps)
+constexpr int LOAD_WARP_ID = CORR_WARP_BASE + CORR_WARP_COUNT;
+constexpr int MMA_WARP_ID = LOAD_WARP_ID + 1;
+constexpr int NUM_WARPS = MMA_WARP_ID + 1;
+constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
+constexpr int PERSISTENT_CTAS_PER_SM = 1;
+
+constexpr int BF16_BYTES = int(sizeof(nv_bfloat16));
+constexpr int MMA_K_BYTES = MMA_K * BF16_BYTES;         // 32
+// In this kernel's matrix-coordinate view, SW128 operand panels are 8 rows x 64 bf16 cols.
+// K-major and MN-major descriptors organize/interpret those panels differently.
+constexpr int SW128_BYTES = 128;
+constexpr int SW128_ATOM_ROWS = 8;
+constexpr int SW128_ATOM_COLS = SW128_BYTES / BF16_BYTES;  // 64 bf16
+#include "smem_layout_swizzle128.cuh"
+
+constexpr int Q_TILE_BYTES = BLOCK_M * HEAD_DIM * BF16_BYTES;
+constexpr int KV_TILE_BYTES = BLOCK_N * HEAD_DIM * BF16_BYTES;
+
+constexpr int TMEM_S_COLS = BLOCK_N;
+constexpr int TMEM_O_COLS = HEAD_DIM;
+constexpr int TMEM_ALLOC_COLS = q_stage::STAGES * TMEM_S_COLS + q_stage::STAGES * TMEM_O_COLS;
+// Full 512-column TMEM budget is consumed by S0/S1 + O0/O1.
+// That is why this q_stage=2 branch cannot also keep an extra S/P time-stage.
+static_assert(TMEM_ALLOC_COLS == 512, "q_stage=2 should pack S0/S1 + O0/O1 into 512 TMEM cols");
+
+// Carrier helpers below name two independent index spaces:
+//   q: Qq, Sq/Pq, Oq, and q-stage barriers.
+//   KV token/stage: logical K/V stream mapped onto physical KV[3] slots.
+// The kernel body owns scheduling, phases, waits/fences, and MMA order.
+
+// Local lightweight helpers for the two-Q-stage carrier.
+// They name q-stage address math only.
+namespace q_stage {
+
+__device__ __forceinline__ int row0(int q_row0_base, int q) {
+  return q_row0_base + q * BLOCK_M;
+}
+
+__device__ __forceinline__ int q_smem(int Q_smem, int q) {
+  return Q_smem + q * Q_TILE_BYTES;
+}
+
+__device__ __forceinline__ int tmem_s(int taddr_s_base, int q) {
+  return taddr_s_base + q * TMEM_S_COLS;
+}
+
+__device__ __forceinline__ int tmem_o(int taddr_o_base, int q) {
+  return taddr_o_base + q * TMEM_O_COLS;
+}
+
+__device__ __forceinline__ int mbar_addr(int base, int q) {
+  return base + q * int(sizeof(uint64_t));
+}
+
+}  // namespace q_stage
+
+// Local lightweight helpers for the unified KV[3] ring.
+// Most helpers are stateless token/stage address math. load_token_and_arrive() is the
+// side-effecting producer primitive: it issues TMA and arrives on kv_ready[stage].
+namespace kv_ring {
+
+constexpr int STAGES = 3;
+constexpr int TOKENS_PER_KV_TILE = 2;
+constexpr int K_KIND = 0;
+constexpr int V_KIND = 1;
+
+__device__ __forceinline__ int logical_token(int kv_tile, int kind) {
+  return TOKENS_PER_KV_TILE * kv_tile + kind;
+}
+
+__device__ __forceinline__ int physical_stage(int token) {
+  return token % STAGES;
+}
+
+__device__ __forceinline__ int token_tile(int token) {
+  return token / TOKENS_PER_KV_TILE;
+}
+
+__device__ __forceinline__ int stage_smem_addr(int KV_smem, int stage) {
+  return KV_smem + stage * KV_TILE_BYTES;
+}
+
+__device__ __forceinline__ int stage_mbar_addr(int mbar_kv_ready_base, int stage) {
+  return mbar_kv_ready_base + stage * int(sizeof(uint64_t));
+}
+
+__device__ __forceinline__ bool is_k_token(int token) {
+  return (token % TOKENS_PER_KV_TILE) == K_KIND;
+}
+
+__device__ __forceinline__ void load_token_and_arrive(
+    int token, int batch_id, int len_kv, int KV_smem, int mbar_kv_ready_base,
+    const CUtensorMap* K_tmap, const CUtensorMap* V_tmap) {
+  const int stage = physical_stage(token);
+  const int tile = token_tile(token);
+  const int kv_row0 = batch_id * len_kv + tile * BLOCK_N;
+  const int mbar_kv_ready_addr = stage_mbar_addr(mbar_kv_ready_base, stage);
+  const int smem_addr = stage_smem_addr(KV_smem, stage);
+
+  // The same physical stage is interpreted as K-major for QK or MN-major for PV.
+  if (is_k_token(token)) {
+    swizzle128::tma_load_kmajor(smem_addr, K_tmap, BLOCK_N, kv_row0, mbar_kv_ready_addr);
+  } else {
+    swizzle128::tma_load_mnmajor(smem_addr, V_tmap, kv_row0, mbar_kv_ready_addr);
+  }
+  mbarrier::arrive_expect_tx(mbar_kv_ready_addr, KV_TILE_BYTES);
+}
+
+}  // namespace kv_ring
+
+// One x16 TMEM load returns 16 scores per lane. The single wait::ld is
+// deferred into the P pass, before
+// the first P store that overwrites the overlapping S/P TMEM region.
+__device__ __forceinline__ void tcgen05_ld_32x32b_x16_nowait(int taddr, float (&out)[16]) {
+  asm volatile(
+      "tcgen05.ld.sync.aligned.32x32b.x16.b32 "
+      "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];\n"
+      : "=f"(out[0]), "=f"(out[1]), "=f"(out[2]), "=f"(out[3]), "=f"(out[4]), "=f"(out[5]),
+        "=f"(out[6]), "=f"(out[7]), "=f"(out[8]), "=f"(out[9]), "=f"(out[10]), "=f"(out[11]),
+        "=f"(out[12]), "=f"(out[13]), "=f"(out[14]), "=f"(out[15])
+      : "r"(taddr));
+}
+
+__device__ __forceinline__ void issue_qk_mma(int taddr_s_stage, int Q_stage_smem,
+                                             int K_stage_smem, uint32_t i_desc_qk) {
+  // outer loop selects SW128 64-wide block
+  constexpr uint64_t qk_desc_micro_step = MMA_K_BYTES / 16;
+  constexpr uint64_t qk_a_desc_panel_step = (BLOCK_M * SW128_BYTES) / 16;
+  constexpr uint64_t qk_b_desc_panel_step = (BLOCK_N * SW128_BYTES) / 16;
+  uint64_t a_desc_panel = swizzle128::desc_kmajor(Q_stage_smem);
+  uint64_t b_desc_panel = swizzle128::desc_kmajor(K_stage_smem);
+  for (int k1 = 0; k1 < HEAD_DIM / SW128_ATOM_COLS; ++k1) {
+    uint64_t a_desc = a_desc_panel;
+    uint64_t b_desc = b_desc_panel;
+    // inner loop selects MMA_K=16 chunk inside that block
+    for (int k2 = 0; k2 < SW128_ATOM_COLS / MMA_K; ++k2) {
+      const int enable_input_d = (k1 == 0 && k2 == 0) ? 0 : 1;
+      tcgen05::mma_f16(taddr_s_stage, a_desc, b_desc, i_desc_qk, enable_input_d);
+      a_desc += qk_desc_micro_step;
+      b_desc += qk_desc_micro_step;
+    }
+    a_desc_panel += qk_a_desc_panel_step;
+    b_desc_panel += qk_b_desc_panel_step;
+  }
+}
+
+__device__ __forceinline__ void issue_pv_mma_range(
+    int taddr_o_stage, int taddr_p_stage, int V_stage_smem,
+    uint32_t i_desc_pv, int first_microstep, int end_microstep,
+    bool initialize_o) {
+  constexpr int pv_v_chunk_bytes = HEAD_DIM * MMA_K_BYTES;
+  constexpr uint64_t pv_desc_chunk_step = pv_v_chunk_bytes / 16;
+  // Offset V by the range's first P microstep so P columns match the corresponding V rows
+  const int v_range_offset_bytes = first_microstep * pv_v_chunk_bytes;
+  uint64_t b_desc = swizzle128::desc_mnmajor(
+      V_stage_smem + v_range_offset_bytes, HEAD_DIM);
+  for (int k = first_microstep; k < end_microstep; ++k) {
+    // Advance by 16 V rows. In the SW128 MN-major layout this is
+    // equivalent to two 8-token row-block strides in SMEM.
+    // Inherited from kernel 2: each PV microstep advances 8 packed-P TMEM columns.
+    const int taddr_a = taddr_p_stage + k * 8;
+    // Disabling input D makes the first issued microstep initialize O
+    const int enable_input_d =
+        (initialize_o && k == first_microstep) ? 0 : 1;
+    tcgen05::mma_f16_a_tmem(
+        taddr_o_stage, taddr_a, b_desc, i_desc_pv, enable_input_d);
+    b_desc += pv_desc_chunk_step;
+  }
+}
+
+}  // namespace
+
+// Kernel 14 launches up to one persistent CTA per SM. This compiler annotation
+// fits that design but is not explicitly required.
+__global__ __launch_bounds__(TB_SIZE, 1) void attention_tcgen05_v16_kernel(
+    const __grid_constant__ CUtensorMap Q_tmap, const __grid_constant__ CUtensorMap K_tmap,
+    const __grid_constant__ CUtensorMap V_tmap, nv_bfloat16* __restrict__ O_ptr, int len_q,
+    int len_kv, int total_work_items) {
+  const int tid = threadIdx.x;
+  const int warp_id = tid / WARP_SIZE;
+  const int lane_id = tid % WARP_SIZE;
+
+  const bool is_softmax_warp = (warp_id < SOFTMAX_WARP_COUNT);
+  const bool is_corr_warp = (warp_id >= CORR_WARP_BASE && warp_id < CORR_WARP_BASE + CORR_WARP_COUNT);
+  const bool is_load_warp = (warp_id == LOAD_WARP_ID);
+  const bool is_mma_warp = (warp_id == MMA_WARP_ID);
+
+  extern __shared__ __align__(1024) char smem_raw[];
+
+  const int smem_base = static_cast<int>(__cvta_generic_to_shared(smem_raw));
+  const int Q_smem = smem_base;
+  const int KV_smem = Q_smem + q_stage::STAGES * Q_TILE_BYTES;
+
+  // Barriers used within one output work item:
+  //   q-ready:            load warp -> mma warp (Q0/Q1 loaded for one work item)
+  //   kv-ready[s]:        load warp -> mma warp (per K/V stage)
+  //   qk-done[q]:         mma warp -> softmax warps for Q stage q
+  //   qk-done[last_q]:    load warp waits on this before recycling an old K token
+  //   stats-ready[q]:     softmax -> correction; rescale_smem for Q stage q is ready
+  //   p-high96-ready-o-safe[q]: softmax+correction warps -> mma warp for high96 Pq and O-safe
+  //   p-full-ready[q]:    softmax warps -> mma warp after full Pq is stored
+  //   pv-done[q]:         MMA -> correction/softmax;
+  //                       previous phase before next-tile O rescale,
+  //                       final phase before softmax output;
+  //                       last-q stream also lets load recycle old V tokens
+  //
+  // Cross-work Q ownership:
+  //   q-free[q]:          MMA -> load; the final QK using Qq has completed, so
+  //                       the load warp may overwrite that Q stage for the next item
+  __shared__ uint64_t mbar_q_ready[1];
+  __shared__ uint64_t mbar_q_free[q_stage::STAGES];
+  __shared__ uint64_t mbar_qk_done[q_stage::STAGES];
+  __shared__ uint64_t mbar_stats_ready[q_stage::STAGES];
+  // Kernel 12's p_ready_o_safe becomes high96-specific here
+  // wait for O-safe once with high96; by the time low32 PV runs, O has already
+  // been rescaled, so p_full_ready only needs to track full-P readiness
+  __shared__ uint64_t mbar_p_high96_ready_o_safe[q_stage::STAGES];
+  __shared__ uint64_t mbar_p_full_ready[q_stage::STAGES];
+  __shared__ uint64_t mbar_pv_done[q_stage::STAGES];
+  __shared__ uint64_t mbar_kv_ready[kv_ring::STAGES];
+  // one additional shared-memory buffer is used to pass per-row rescale values
+  // from softmax warps to correction warps
+  // no compute-stage dimension: each Q stage has only one live rescale handoff at a time
+  // because there is no temporal compute overlap (across KV-tile iterations)
+  // within the same Q tile
+  __shared__ float rescale_smem[q_stage::STAGES][BLOCK_M];
+  __shared__ int tmem_addr[1];
+
+  const int mbar_q_ready_addr = static_cast<int>(__cvta_generic_to_shared(mbar_q_ready));
+  const int mbar_q_free_base = static_cast<int>(__cvta_generic_to_shared(mbar_q_free));
+  const int mbar_qk_done_base = static_cast<int>(__cvta_generic_to_shared(mbar_qk_done));
+  const int mbar_stats_ready_base = static_cast<int>(__cvta_generic_to_shared(mbar_stats_ready));
+  const int mbar_p_high96_ready_o_safe_base = static_cast<int>(__cvta_generic_to_shared(mbar_p_high96_ready_o_safe));
+  const int mbar_p_full_ready_base = static_cast<int>(__cvta_generic_to_shared(mbar_p_full_ready));
+  const int mbar_pv_done_base = static_cast<int>(__cvta_generic_to_shared(mbar_pv_done));
+  const int mbar_kv_ready_base = static_cast<int>(__cvta_generic_to_shared(mbar_kv_ready));
+
+  if (is_load_warp && elect_sync()) {
+    // Every barrier is initialized once before the initial CTA sync. Barrier
+    // objects and their phase cursors then persist across output work items.
+    // There is no setup_done/work_done rendezvous: the work-item seam is pure
+    // dataflow (Q SMEM via q_free, the KV ring via the recycle streams, and
+    // S/P/O TMEM via MMA program order plus the o_safe chain).
+    mbarrier::init(mbar_q_ready_addr, 1);
+    for (int q = 0; q < q_stage::STAGES; ++q) {
+      mbarrier::init(q_stage::mbar_addr(mbar_q_free_base, q), 1);
+      mbarrier::init(q_stage::mbar_addr(mbar_qk_done_base, q), 1);
+      mbarrier::init(q_stage::mbar_addr(mbar_stats_ready_base, q), SOFTMAX_WARPS_PER_STAGE);
+      // 4 softmax arrivals publish high96 P and 4 correction arrivals publish O-safe
+      mbarrier::init(q_stage::mbar_addr(mbar_p_high96_ready_o_safe_base, q),
+                     SOFTMAX_WARPS_PER_STAGE + CORR_WARP_COUNT);
+      mbarrier::init(q_stage::mbar_addr(mbar_p_full_ready_base, q), SOFTMAX_WARPS_PER_STAGE);
+      mbarrier::init(q_stage::mbar_addr(mbar_pv_done_base, q), 1);
+    }
+    for (int st = 0; st < kv_ring::STAGES; ++st) {
+      mbarrier::init(kv_ring::stage_mbar_addr(mbar_kv_ready_base, st), 1);
+    }
+    asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+  }
+  if (is_mma_warp) {
+    // TMEM layout:
+    //   S0 at [0..127], S1 at [128..255], O0 at [256..383], O1 at [384..511]
+    //   P overlays S at S + 64 b32 columns
+    //   low32 P:  S+[64..79]   logical P[:, 0:32]
+    //   high96 P: S+[80..127]  logical P[:, 32:128]
+    //   early PV reads high96 while softmax rereads S+[0..31] and writes low32 P
+    const int tmem_smem_addr = static_cast<int>(__cvta_generic_to_shared(tmem_addr));
+    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;\n"
+                 :
+                 : "r"(tmem_smem_addr), "r"(TMEM_ALLOC_COLS)
+                 : "memory");
+  }
+  __syncthreads();
+
+  const int taddr_base = tmem_addr[0];
+  const int taddr_s_base = taddr_base;
+  // Swizzle applies to SMEM operand descriptors (Q/K/V), not the TMEM O accumulator.
+  const int taddr_o_base = taddr_s_base + q_stage::STAGES * TMEM_S_COLS;
+
+  // QK MMA descriptor:
+  //   dtype=fp32 (bit4), atype=bf16 (bit7), btype=bf16 (bit10)
+  //   MMA_N encoded at bit17, MMA_M at bit24.
+  constexpr uint32_t i_desc_qk =
+      (1U << 4) |                    // accumulator dtype fp32
+      (1U << 7) |                    // A dtype bf16
+      (1U << 10) |                   // B dtype bf16
+      ((BLOCK_N >> 3) << 17) |       // MMA_N / 8
+      ((BLOCK_M >> 4) << 24);        // MMA_M / 16
+
+  // PV uses MN-major B (bit 16).
+  constexpr uint32_t i_desc_pv = i_desc_qk | (1U << 16);
+
+  const int kv_tiles = len_kv / BLOCK_N;
+
+  // Persistent CTA work assignment
+  //
+  // Role-local persistent loops let each warp role advance independently. A
+  // role enters the next work item once the resources it owns are safe.
+  //
+  // work_id identifies one batch and one Q0/Q1 output-tile pair within that batch.
+  // Earlier kernels launched one CTA per work item, so blockIdx.x was also work_id.
+  // In kernel 14, the stub caps the number of CTAs (gridDim.x) at the number of SMs.
+  // Each CTA starts with work_id = blockIdx.x, then advances it by the number of CTAs
+  // (gridDim.x) to process the remaining work items assigned to it. Together, the
+  // CTAs cover all output work items. Each work item covers two consecutive Q tiles
+  // and their matching O tiles, spanning q_stage::ROWS_PER_WORK_ITEM Q/O rows.
+
+  // Load-warp K/V pipeline
+  //
+  // The load warp drives one generic K/V token stream through KV[3] per work item.
+  // Even tokens are K(tile), odd tokens are V(tile). A physical stage is reusable
+  // after the last Q stage consumes a K token for QK or a V token for PV.
+  if (is_load_warp && elect_sync()) {
+
+    int phase_k_recycle = 0;
+    int phase_v_recycle = 0;
+    int phase_q_free = 0;  // one phase per item, armed by MMA's final QKs
+
+    // Compute this CTA's work IDs inside the kernel: start at blockIdx.x, step
+    // by the number of CTAs, and stop when the next ID is >= total_work_items.
+    for (int work_id = blockIdx.x, work_iter = 0; work_id < total_work_items;
+         work_id += gridDim.x, ++work_iter) {
+
+      // No global work-item setup occurs here. Do not overwrite Q0/Q1 until the
+      // previous item's final QK MMAs have consumed them (commit-armed by
+      // the MMA warp, one phase per item).
+      if (work_iter > 0) {
+        for (int q = 0; q < q_stage::STAGES; ++q) {
+          mbarrier::wait(q_stage::mbar_addr(mbar_q_free_base, q), phase_q_free);
+        }
+        phase_q_free ^= 1;
+        asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
+      }
+
+      // Input loading (steps 3-5)
+      //
+      // 3) Load Q once
+      //
+      // Load Q0 and Q1 once for this work item.
+      const int q_row0_base = work_id * q_stage::ROWS_PER_WORK_ITEM;
+      for (int q = 0; q < q_stage::STAGES; ++q) {
+        const int Q_stage_smem = q_stage::q_smem(Q_smem, q);
+        const int q_row0_stage = q_stage::row0(q_row0_base, q);
+        swizzle128::tma_load_kmajor(Q_stage_smem, &Q_tmap, BLOCK_M, q_row0_stage,
+                                          mbar_q_ready_addr);
+      }
+      mbarrier::arrive_expect_tx(mbar_q_ready_addr, q_stage::STAGES * Q_TILE_BYTES);
+
+      const int last_q = q_stage::STAGES - 1;
+      const int mbar_last_qk_done_addr = q_stage::mbar_addr(mbar_qk_done_base, last_q);
+      const int mbar_last_pv_done_addr = q_stage::mbar_addr(mbar_pv_done_base, last_q);
+      const int kv_tokens = kv_ring::TOKENS_PER_KV_TILE * kv_tiles;
+      const int prefill_tokens = (kv_tokens < kv_ring::STAGES) ? kv_tokens : kv_ring::STAGES;
+
+      // For kv_tiles >= 2, the three KV stages' previous occupants are the
+      // previous item's last three tokens {V(K-2), K(K-1), V(K-1)}. Catch up
+      // their consumer phases here
+      // (pv @K-2, pv @K-1, qk @K-1); every stage is then free and the
+      // prefill needs no per-token wait.
+      if (work_iter > 0) {
+        if (kv_tiles >= 2) {
+          mbarrier::wait(mbar_last_pv_done_addr, phase_v_recycle);
+          phase_v_recycle ^= 1;
+        }
+        // (kv_tiles == 1: only {K(0), V(0)} ever occupied the ring -> one pv
+        // and one qk leftover)
+        mbarrier::wait(mbar_last_pv_done_addr, phase_v_recycle);
+        phase_v_recycle ^= 1;
+        mbarrier::wait(mbar_last_qk_done_addr, phase_k_recycle);
+        phase_k_recycle ^= 1;
+        asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
+      }
+
+      // 4) Prefill the K/V ring
+      //
+      // Prefill: the first KV[3] tokens fill one token per physical KV stage;
+      // no old token exists yet, so there is no recycle wait.
+      // work_id flattens (batch_id, Q-tile-pair index). Divide by the number
+      // of work items per batch to recover the batch used for K/V loads.
+      const int work_items_per_batch = len_q / q_stage::ROWS_PER_WORK_ITEM;
+      const int batch_id = work_id / work_items_per_batch;
+      for (int token = 0; token < prefill_tokens; ++token) {
+        kv_ring::load_token_and_arrive(
+            token, batch_id, len_kv, KV_smem, mbar_kv_ready_base, &K_tmap, &V_tmap);
+      }
+
+      // 5) Refill the K/V ring
+      //
+      // Refill: token T reuses the stage occupied by token T-KV[3], so wait on
+      // the last Q stage's consumer before overwriting that physical stage.
+      for (int token = prefill_tokens; token < kv_tokens; ++token) {
+        const int recycle_token = token - kv_ring::STAGES;
+        if (kv_ring::is_k_token(recycle_token)) {
+          mbarrier::wait(mbar_last_qk_done_addr, phase_k_recycle);
+          phase_k_recycle ^= 1;
+          asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
+        } else {
+          mbarrier::wait(mbar_last_pv_done_addr, phase_v_recycle);
+          phase_v_recycle ^= 1;
+          asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
+        }
+
+        kv_ring::load_token_and_arrive(
+            token, batch_id, len_kv, KV_smem, mbar_kv_ready_base, &K_tmap, &V_tmap);
+      }
+
+    }
+  }
+
+  // MMA warp: after PVq(i), immediately produce QKq(i+1) into the freed q-stage slot.
+  if (is_mma_warp && elect_sync()) {
+    // Role-scope phase arrays carry parity across work items.
+    int phase_kv_ready[kv_ring::STAGES] = {};
+    int phase_p_high96_ready_o_safe[q_stage::STAGES] = {};
+    int phase_p_full_ready[q_stage::STAGES] = {};
+    for (int work_id = blockIdx.x, work_iter = 0; work_id < total_work_items;
+         work_id += gridDim.x, ++work_iter) {
+
+      mbarrier::wait(mbar_q_ready_addr, work_iter & 1);
+      asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
+
+
+      // Compute prologue: seed both Q stages for tile 0;
+      // creates S0 and S1, so the softmax warps have S0->P0 and S1->P1 work.
+      const int k_token0 = kv_ring::logical_token(0, kv_ring::K_KIND);
+      const int k_stage0 = kv_ring::physical_stage(k_token0);
+      const int mbar_kv_ready_addr0 = kv_ring::stage_mbar_addr(mbar_kv_ready_base, k_stage0);
+      const int K_stage_smem0 = kv_ring::stage_smem_addr(KV_smem, k_stage0);
+
+      mbarrier::wait(mbar_kv_ready_addr0, phase_kv_ready[k_stage0]);
+      phase_kv_ready[k_stage0] ^= 1;
+      asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
+
+      for (int q = 0; q < q_stage::STAGES; ++q) {
+        const int mbar_qk_done_addr = q_stage::mbar_addr(mbar_qk_done_base, q);
+        const int Q_stage_smem = q_stage::q_smem(Q_smem, q);
+        const int taddr_s_stage = q_stage::tmem_s(taddr_s_base, q);
+
+        issue_qk_mma(taddr_s_stage, Q_stage_smem, K_stage_smem0, i_desc_qk);
+
+        // Track QK completion; the mbarrier arrives when this Q stage's S is ready.
+        tcgen05::commit_arrive(mbar_qk_done_addr);
+        // Single-tile items consume Q in the prologue QK.
+        if (kv_tiles == 1) {
+          tcgen05::commit_arrive(q_stage::mbar_addr(mbar_q_free_base, q));
+        }
+      }
+
+      // Compute main loop: for kv tile: for q_idx in num_Q_stages: PV[q_idx](i), QK[q_idx](i+1)
+      for (int kv_tile = 0; kv_tile < kv_tiles; ++kv_tile) {
+        const int v_token = kv_ring::logical_token(kv_tile, kv_ring::V_KIND);
+        const int v_stage = kv_ring::physical_stage(v_token);
+        const bool first_kv = (kv_tile == 0);
+        const int mbar_v_ready_addr = kv_ring::stage_mbar_addr(mbar_kv_ready_base, v_stage);
+        const int V_stage_smem = kv_ring::stage_smem_addr(KV_smem, v_stage);
+
+        const int next_tile = kv_tile + 1;
+        const bool have_next = (next_tile < kv_tiles);
+        int next_k_stage = 0;
+        int next_mbar_kv_ready_addr = 0;
+        int next_K_stage_smem = 0;
+        if (have_next) {
+          const int next_k_token = kv_ring::logical_token(next_tile, kv_ring::K_KIND);
+          next_k_stage = kv_ring::physical_stage(next_k_token);
+          next_mbar_kv_ready_addr = kv_ring::stage_mbar_addr(mbar_kv_ready_base, next_k_stage);
+          next_K_stage_smem = kv_ring::stage_smem_addr(KV_smem, next_k_stage);
+        }
+
+        mbarrier::wait(mbar_v_ready_addr, phase_kv_ready[v_stage]);
+        phase_kv_ready[v_stage] ^= 1;
+        asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
+
+        for (int q = 0; q < q_stage::STAGES; ++q) {
+          const int mbar_p_high96_ready_o_safe_addr =
+              q_stage::mbar_addr(mbar_p_high96_ready_o_safe_base, q);
+          const int mbar_p_full_ready_addr = q_stage::mbar_addr(mbar_p_full_ready_base, q);
+          const int mbar_pv_done_addr = q_stage::mbar_addr(mbar_pv_done_base, q);
+          const int taddr_s_stage = q_stage::tmem_s(taddr_s_base, q);
+          const int taddr_p_stage = taddr_s_stage + BLOCK_N / 2;  // preserve low32 S for reread
+          const int taddr_o_stage = q_stage::tmem_o(taddr_o_base, q);
+
+          mbarrier::wait(mbar_p_high96_ready_o_safe_addr,
+                         phase_p_high96_ready_o_safe[q]);
+          phase_p_high96_ready_o_safe[q] ^= 1;
+          asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
+
+          // early PV starts from P[:, 32:128], not the beginning of P; offset B by the
+          // same two K=16 chunks to select the corresponding V[32:128, :] rows
+          // Issue the ready high96 first (k=2..7); its first microstep initializes O on KV tile 0
+          issue_pv_mma_range(
+              taddr_o_stage, taddr_p_stage, V_stage_smem, i_desc_pv,
+              /*first_microstep=*/EARLY_PV_START_MICROSTEP,
+              /*end_microstep=*/BLOCK_N / MMA_K,
+              /*initialize_o=*/first_kv);
+
+          mbarrier::wait(mbar_p_full_ready_addr, phase_p_full_ready[q]);
+          phase_p_full_ready[q] ^= 1;
+          asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
+
+          // Then issue the remaining low32 (k=0..1), accumulating into the high96 result
+          issue_pv_mma_range(
+              taddr_o_stage, taddr_p_stage, V_stage_smem, i_desc_pv,
+              /*first_microstep=*/0,
+              /*end_microstep=*/EARLY_PV_START_MICROSTEP,
+              /*initialize_o=*/false);
+
+          // Track PV completion; the mbarrier arrives when this Q stage's O is ready.
+          tcgen05::commit_arrive(mbar_pv_done_addr);
+
+          if (have_next) {
+            // The next K token is shared by q0 and q1, so consume its ready phase once.
+            if (q == 0) {
+              mbarrier::wait(next_mbar_kv_ready_addr, phase_kv_ready[next_k_stage]);
+              phase_kv_ready[next_k_stage] ^= 1;
+              asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
+            }
+
+            const int mbar_qk_done_addr = q_stage::mbar_addr(mbar_qk_done_base, q);
+            const int Q_stage_smem = q_stage::q_smem(Q_smem, q);
+            const int taddr_s_stage = q_stage::tmem_s(taddr_s_base, q);
+
+            issue_qk_mma(taddr_s_stage, Q_stage_smem, next_K_stage_smem, i_desc_qk);
+
+            // Track QK completion; the mbarrier arrives when this Q stage's S is ready.
+            tcgen05::commit_arrive(mbar_qk_done_addr);
+            // The QK issued at tile K-2 targets tile K-1 —
+            // the final read of this item's Q[q]; arm q_free for the load
+            // warp's next-item Q overwrite.
+            if (kv_tile == kv_tiles - 2) {
+              tcgen05::commit_arrive(q_stage::mbar_addr(mbar_q_free_base, q));
+            }
+          }
+        }
+      }
+
+    }
+  }
+
+  // Softmax warps: one 4-warp group per Q stage.
+  if (is_softmax_warp) {
+
+    // Each Q stage has 4 softmax warps, each covering 32 of its 128 rows
+    const int softmax_stage = warp_id / SOFTMAX_WARPS_PER_STAGE;
+    const int local_warp_idx = warp_id % SOFTMAX_WARPS_PER_STAGE;
+    // These cursors persist because their barriers are never reset per item.
+    int phase_qk_done = 0;
+    int pv_done_phase_base = 0;  // cumulative pv_done parity at item start
+    const int row_base = local_warp_idx * WARP_SIZE;  // first of 32 rows owned by this warp
+    const int row = row_base + lane_id;               // specific row owned by this lane
+    const int trow = row_base << 16;                  // encode row_base for TMEM addressing
+
+    for (int work_id = blockIdx.x, work_iter = 0; work_id < total_work_items;
+         work_id += gridDim.x, ++work_iter) {
+
+      // This softmax warp belongs to one fixed q-stage, so it only needs one
+      // work-local cursor for that qk_done stream.
+
+      // q-stage-local resources for this softmax warp; invariant across all KV tiles.
+      const int mbar_qk_done_addr = q_stage::mbar_addr(mbar_qk_done_base, softmax_stage);
+      const int mbar_stats_ready_addr = q_stage::mbar_addr(mbar_stats_ready_base, softmax_stage);
+      const int mbar_p_high96_ready_o_safe_addr = q_stage::mbar_addr(mbar_p_high96_ready_o_safe_base, softmax_stage);
+      const int mbar_p_full_ready_addr = q_stage::mbar_addr(mbar_p_full_ready_base, softmax_stage);
+      const int taddr_s_stage = q_stage::tmem_s(taddr_s_base, softmax_stage);
+      const int taddr_p_stage = taddr_s_stage + BLOCK_N / 2;  // preserve low32 S for reread
+
+      // Online softmax state per row and per Q stage.
+      // active softmax reference in exp2-input units; may lag the true running max while
+      // the increase remains below ROWMAX_REBASE_THRESHOLD_LOG2
+      float rowmax = -FLT_MAX;
+      float rowsum = 0.0f;
+      constexpr float LOG2_E = 1.4426950408889634f;
+      const float softmax_scale = rsqrtf(float(HEAD_DIM));
+      // Keep exp arguments in exp2 units instead of letting each __expf site
+      // locally form (natural_exp_arg * log2(e)).
+      const float softmax_scale_log2 = softmax_scale * LOG2_E;
+
+      for (int kv_tile = 0; kv_tile < kv_tiles; ++kv_tile) {
+        const bool first_kv = (kv_tile == 0);
+
+        mbarrier::wait(mbar_qk_done_addr, phase_qk_done);
+        phase_qk_done ^= 1;
+        asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
+
+        // Inherited from Kernel 15: x16 nowait score loads, four rowmax chains,
+        // and one wait::ld deferred into the P pass.
+        float cached_scores[NUM_CACHED_FRAGMENTS][8];
+        float rowmax0 = -FLT_MAX;
+        float rowmax1 = -FLT_MAX;
+        float rowmax2 = -FLT_MAX;
+        float rowmax3 = -FLT_MAX;
+        {
+#pragma unroll
+          for (int score_n16 = 0; score_n16 < BLOCK_N / 16; ++score_n16) {
+            float s16[16];
+            const int taddr = taddr_s_stage + trow + score_n16 * 16;
+            tcgen05_ld_32x32b_x16_nowait(taddr, s16);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+              rowmax0 = fmaxf(rowmax0, s16[4 * i + 0]);
+              rowmax1 = fmaxf(rowmax1, s16[4 * i + 1]);
+              rowmax2 = fmaxf(rowmax2, s16[4 * i + 2]);
+              rowmax3 = fmaxf(rowmax3, s16[4 * i + 3]);
+            }
+            if (score_n16 >= FIRST_CACHED_FRAGMENT / 2) {
+              // This pass visits eight x16 fragments and caches the final six
+              // (high96), mapping each x16 result into two x8 cache slots.
+              const int cache_fragment = (score_n16 - FIRST_CACHED_FRAGMENT / 2) * 2;
+#pragma unroll
+              for (int i = 0; i < 8; ++i) {
+                cached_scores[cache_fragment][i] = s16[i];
+                cached_scores[cache_fragment + 1][i] = s16[8 + i];
+              }
+            }
+          }
+        }
+
+        // We need to multiply both scores and rowmax into the same log2/exp2-input
+        // units before subtracting rowmax from the scores.
+        const float tile_rowmax =
+            fmaxf(fmaxf(rowmax0, rowmax1), fmaxf(rowmax2, rowmax3)) * softmax_scale_log2;
+        const float candidate_rowmax = fmaxf(rowmax, tile_rowmax);
+        const float rowmax_increase = candidate_rowmax - rowmax;
+
+        // below the threshold, leave rowmax and rowsum unchanged and keep rescale at 1
+        const bool row_needs_o_rescale =
+            !first_kv && rowmax_increase >= ROWMAX_REBASE_THRESHOLD_LOG2;
+
+        float rescale = 1.0f;
+        if (first_kv) {
+          // no previous O or rowsum exists yet, so the first tile only initializes the reference
+          rowmax = candidate_rowmax;
+        } else if (row_needs_o_rescale) {
+          // only evaluate exp2 when rebasing to a higher softmax reference
+          rescale = approx::fast_exp2(rowmax - candidate_rowmax);
+          rowmax = candidate_rowmax;
+          rowsum *= rescale;
+        }
+        rescale_smem[softmax_stage][row] = rescale;
+
+        __syncwarp();
+        if (lane_id == 0) {
+          mbarrier::arrive(mbar_stats_ready_addr);
+        }
+
+        float tile_rowsum = 0.0f;
+        {
+          const int taddr_s_row = taddr_s_stage + trow;
+          const int taddr_p_row = taddr_p_stage + trow;
+          // Cache96/reread32 gives this P pass two sources: cached high-96 S and reread low-32 S
+          // This schedule signals p_high96_ready_o_safe after high96 is stored
+          // and correction has made O safe; low32 is stored before p_full_ready
+          // The P pass walks high->low so the most recently cached high96 values are reused first.
+          // The two phases are spelled as two loops: the cached high96 phase
+          // accumulates its rowsum in an f32x2 pair (folded once at the
+          // boundary), the reread low32 phase accumulates into the scalar.
+          // Keep the packed chain only while its cached high96 inputs are live;
+          // the reread low32 tail retains the scalar accumulation used by Kernel 15.
+          float2 high96_rowsum_pair = make_float2(0.0f, 0.0f);
+#pragma unroll
+          for (int score_n16 = BLOCK_N / 16 - 1; score_n16 >= EARLY_PV_START_MICROSTEP; --score_n16) {
+            uint32_t p8_packed[8];
+#pragma unroll
+            for (int half8 = 0; half8 < 2; ++half8) {
+              const int score_n8 = score_n16 * 2 + half8;
+              float s8[8];
+              // reuse high96 scores retained in registers during the rowmax pass
+              const int cache_fragment = score_n8 - FIRST_CACHED_FRAGMENT;
+#pragma unroll
+              for (int i = 0; i < 8; ++i) {
+                s8[i] = cached_scores[cache_fragment][i];
+              }
+#pragma unroll
+              for (int j = 0; j < 4; ++j) {
+                // packed FMA as one fused operation: score * scale + (-rowmax)
+                const float2 shifted_score_pair = f32x2::fma_rn_ftz(
+                    make_float2(s8[2 * j], s8[2 * j + 1]), softmax_scale_log2, -rowmax);
+                const float shifted_score0 = shifted_score_pair.x;
+                const float shifted_score1 = shifted_score_pair.y;
+
+                // pair position within the current 16-column block
+                const int pair_start_in_block = half8 * 8 + 2 * j;
+                // use hardware exp2 for the first 12 values and software exp2 for the final 4
+                const bool use_software_exp2 = pair_start_in_block >= 12;
+                float p0;
+                float p1;
+                if (use_software_exp2) {
+                  approx::e2e_exp2_pair(shifted_score0, shifted_score1, p0, p1);
+                } else {
+                  p0 = approx::fast_exp2(shifted_score0);
+                  p1 = approx::fast_exp2(shifted_score1);
+                }
+                high96_rowsum_pair = f32x2::add_rn_ftz(high96_rowsum_pair, make_float2(p0, p1));
+                p8_packed[half8 * 4 + j] = bf16::pack2_to_u32(p0, p1);
+              }
+            }
+            if (score_n16 == BLOCK_N / 16 - 1) {
+              // Complete all deferred score loads before this first P store
+              // overwrites the overlapping S/P TMEM region.
+              asm volatile("tcgen05.wait::ld.sync.aligned;\n" ::: "memory");
+            }
+            tcgen05::st_32x32b_x8_u32(taddr_p_row + score_n16 * 8, p8_packed);
+          }
+          // after traversing 96 columns right-to-left, we reach the boundary before the
+          // leftmost 32 and signal that the rightmost 96 columns are ready
+          asm volatile("tcgen05.wait::st.sync.aligned;\n" ::: "memory");
+          asm volatile("tcgen05.fence::before_thread_sync;\n" ::: "memory");
+          __syncwarp();
+          if (lane_id == 0) {
+            mbarrier::arrive(mbar_p_high96_ready_o_safe_addr);
+          }
+          tile_rowsum += high96_rowsum_pair.x + high96_rowsum_pair.y;
+#pragma unroll
+          for (int score_n16 = EARLY_PV_START_MICROSTEP - 1; score_n16 >= 0; --score_n16) {
+            uint32_t p8_packed[8];
+#pragma unroll
+            for (int half8 = 0; half8 < 2; ++half8) {
+              const int score_n8 = score_n16 * 2 + half8;
+              float s8[8];
+              // low32 was not cached, so reread it from TMEM
+              tcgen05::ld_32x32b_x8(taddr_s_row + score_n8 * 8, s8);
+#pragma unroll
+              for (int j = 0; j < 4; ++j) {
+                // packed FMA as one fused operation: score * scale + (-rowmax)
+                const float2 shifted_score_pair = f32x2::fma_rn_ftz(
+                    make_float2(s8[2 * j], s8[2 * j + 1]), softmax_scale_log2, -rowmax);
+                const float shifted_score0 = shifted_score_pair.x;
+                const float shifted_score1 = shifted_score_pair.y;
+
+                // pair position within the current 16-column block
+                const int pair_start_in_block = half8 * 8 + 2 * j;
+                // use hardware exp2 for the first 12 values and software exp2 for the final 4
+                const bool use_software_exp2 = pair_start_in_block >= 12;
+                float p0;
+                float p1;
+                if (use_software_exp2) {
+                  approx::e2e_exp2_pair(shifted_score0, shifted_score1, p0, p1);
+                } else {
+                  p0 = approx::fast_exp2(shifted_score0);
+                  p1 = approx::fast_exp2(shifted_score1);
+                }
+                tile_rowsum += p0 + p1;
+                p8_packed[half8 * 4 + j] = bf16::pack2_to_u32(p0, p1);
+              }
+            }
+            tcgen05::st_32x32b_x8_u32(taddr_p_row + score_n16 * 8, p8_packed);
+          }
+          asm volatile("tcgen05.wait::st.sync.aligned;\n" ::: "memory");
+        }
+
+        asm volatile("tcgen05.fence::before_thread_sync;\n" ::: "memory");
+        __syncwarp();
+        if (lane_id == 0) {
+          mbarrier::arrive(mbar_p_full_ready_addr);
+        }
+
+        rowsum += tile_rowsum;
+      }
+
+      const int mbar_pv_done_addr = q_stage::mbar_addr(mbar_pv_done_base, softmax_stage);
+      // (kv_tiles - 1) & 1 does not by itself mean "the final PV iteration." It is
+      // just a bit that flips every iteration, so the same value appeared on earlier
+      // tiles too. It means "final" here only because we check it at a point where
+      // the surrounding loop and dependencies already
+      // prove we are at the last relevant tile. The surrounding context makes it
+      // final, not the bit value itself.
+      //
+      // Specifically, the loop's final qk_done wait ensures pv_done has reached
+      // PV(q,K-1)'s phase, and no PV(q,K) exists. Thus PV(q,K-1) is current or
+      // immediately preceding at this point.
+      const int final_pv_phase = (pv_done_phase_base + kv_tiles - 1) & 1;
+      pv_done_phase_base ^= (kv_tiles & 1);
+      // Correction iterations 1..K-1 observed PV(q,0)..PV(q,K-2).
+      // Softmax observes final PV(q,K-1) before reading the final O accumulator.
+      mbarrier::wait(mbar_pv_done_addr, final_pv_phase);
+      asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
+
+      const float inv_denom = 1.0f / rowsum;
+      const int taddr_o_stage = q_stage::tmem_o(taddr_o_base, softmax_stage);
+      const int q_row0_base = work_id * q_stage::ROWS_PER_WORK_ITEM;
+      const int q_row0_stage = q_stage::row0(q_row0_base, softmax_stage);
+      float o8[8];
+#pragma unroll
+      for (int out_n8 = 0; out_n8 < HEAD_DIM / 8; ++out_n8) {
+        const int taddr = taddr_o_stage + trow + out_n8 * 8;
+        tcgen05::ld_32x32b_x8(taddr, o8);
+
+        nv_bfloat162 out_bf16x2[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const float2 v = make_float2(o8[2 * i] * inv_denom, o8[2 * i + 1] * inv_denom);
+          out_bf16x2[i] = __float22bfloat162_rn(v);
+        }
+
+        nv_bfloat16* out_ptr = O_ptr + (q_row0_stage + row) * HEAD_DIM + out_n8 * 8;
+        reinterpret_cast<int4*>(out_ptr)[0] = reinterpret_cast<int4*>(out_bf16x2)[0];
+      }
+
+      // TODO: __syncwarp()?
+    }
+  }
+
+  // Correction warps: shared across both Q stages.
+  if (is_corr_warp) {
+
+    // Each correction warp reads the rescale factors written by the corresponding
+    // softmax warp for the same 32 rows, servicing q0 then q1
+    const int local_warp_idx = warp_id - CORR_WARP_BASE;
+    // Role-scope phase arrays carry parity across work items.
+    int phase_stats_ready[q_stage::STAGES] = {};
+    int phase_pv_done[q_stage::STAGES] = {};
+    const int row_base = local_warp_idx * WARP_SIZE;  // first of 32 rows owned by this warp
+    const int row = row_base + lane_id;               // specific row owned by this lane
+    const int trow = row_base << 16;                  // encode row_base for TMEM addressing
+
+    for (int work_id = blockIdx.x, work_iter = 0; work_id < total_work_items;
+         work_id += gridDim.x, ++work_iter) {
+
+      // Correction consumes only K-1 of the K
+      // pv_done phases per item — the final phase belongs to softmax's
+      // finalization wait on this carrier — so the persistent cursor drifts
+      // one phase per q-stream per item and must realign at each boundary.
+      if (work_iter > 0) {
+        phase_pv_done[0] ^= 1;
+        phase_pv_done[1] ^= 1;
+      }
+
+      // Match MMA's tile-major q0->q1 order. Processing every q0 tile first
+      // would withhold q1's O-safe arrival and deadlock MMA.
+      for (int kv_tile = 0; kv_tile < kv_tiles; ++kv_tile) {
+        const bool first_kv = (kv_tile == 0);
+
+        for (int q = 0; q < q_stage::STAGES; ++q) {
+          const int mbar_stats_ready_addr = q_stage::mbar_addr(mbar_stats_ready_base, q);
+          const int mbar_pv_done_addr = q_stage::mbar_addr(mbar_pv_done_base, q);
+          const int mbar_p_high96_ready_o_safe_addr =
+              q_stage::mbar_addr(mbar_p_high96_ready_o_safe_base, q);
+          const int taddr_o_stage = q_stage::tmem_o(taddr_o_base, q);
+
+          mbarrier::wait(mbar_stats_ready_addr, phase_stats_ready[q]);
+          phase_stats_ready[q] ^= 1;
+          if (!first_kv) {
+            // Softmax publishes stats_ready(q,i) only after waiting on qk_done(q,i).
+            // MMA issues PV(q,i-1) before QK(q,i), so stats_ready already proves
+            // that the previous PV operation completed (so a separate pv_done wait
+            // is not needed for the data dependency). But PTX requires at least one
+            // successful wait on each mbarrier phase before the next phase receives
+            // an arrival. pv_done is a different mbarrier (not the stats_ready we
+            // just waited on), so we additionally observe pv_done below.
+            // This wait should not expose the preceding PV's compute latency because
+            // stats_ready already established completion of that computation.
+            mbarrier::wait(mbar_pv_done_addr, phase_pv_done[q]);
+            phase_pv_done[q] ^= 1;
+          }
+          // Order correction's O access after stats_ready and, after tile 0, the previous PV.
+          asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
+          // TODO: redundant?; current understanding, using to reconverge all lanes
+          // after their per-lane barrier waits
+          __syncwarp();
+
+          if (!first_kv) {
+            const float row_rescale = rescale_smem[q][row];
+            // TMEM O loads/stores are warp-wide collectives, so if even one of these 32 rows
+            // needs rescaling, all 32 lanes run the pass; unchanged rows multiply O by 1
+            const bool any_row_needs_o_rescale =
+                __any_sync(FULL_WARP_MASK, row_rescale != 1.0f);
+            if (any_row_needs_o_rescale) {
+              float o8[8];
+#pragma unroll
+              for (int out_n8 = 0; out_n8 < HEAD_DIM / 8; ++out_n8) {
+                const int taddr = taddr_o_stage + trow + out_n8 * 8;
+                tcgen05::ld_32x32b_x8(taddr, o8);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                  o8[i] *= row_rescale;
+                }
+                tcgen05::st_32x32b_x8(taddr, o8);
+              }
+              asm volatile("tcgen05.wait::st.sync.aligned;\n" ::: "memory");
+              asm volatile("tcgen05.fence::before_thread_sync;\n" ::: "memory");
+            }
+          }
+
+          // wait until all lanes finish their part of O rescaling before lane 0 publishes O-safe
+          __syncwarp();
+          if (lane_id == 0) {
+            mbarrier::arrive(mbar_p_high96_ready_o_safe_addr);
+          }
+        }
+      }
+
+      __syncwarp();
+    }
+  }
+
+  // Wait until every warp role leaves its persistent loop before the MMA warp
+  // deallocates TMEM. This final CTA sync is outside the work-item hot path.
+  __syncthreads();
+  if (is_mma_warp) {
+    asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
+    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;\n"
+                 :
+                 : "r"(taddr_base), "r"(TMEM_ALLOC_COLS)
+                 : "memory");
+  }
+}
+
+void attention_tcgen05_v16_launch(const nv_bfloat16* Q_ptr, const nv_bfloat16* K_ptr,
+                                  const nv_bfloat16* V_ptr, nv_bfloat16* O_ptr, int bs,
+                                  int len_q, int len_kv, cudaStream_t stream) {
+  TORCH_CHECK(bs > 0, "bs must be positive");
+  TORCH_CHECK(len_q >= q_stage::ROWS_PER_WORK_ITEM, "len_q must be at least 256");
+  TORCH_CHECK(len_q % q_stage::ROWS_PER_WORK_ITEM == 0, "len_q must be a multiple of 256");
+  TORCH_CHECK(len_kv >= BLOCK_N, "len_kv must be at least 128");
+  TORCH_CHECK(len_kv % BLOCK_N == 0, "len_kv must be a multiple of 128");
+
+  const int Q_height = bs * len_q;
+  const int KV_height = bs * len_kv;
+
+  CUtensorMap Q_tmap{};
+  CUtensorMap K_tmap{};
+  CUtensorMap V_tmap{};
+
+  // Inherited from kernel 3: tensor maps use SW128 boxes matching the SMEM operand layout.
+  init_tmap_2d_simple(&Q_tmap, const_cast<nv_bfloat16*>(Q_ptr), /*global_height=*/Q_height,
+                      /*global_width=*/HEAD_DIM,
+                      /*shared_height=*/BLOCK_M, /*shared_width=*/SW128_ATOM_COLS,
+                      CU_TENSOR_MAP_SWIZZLE_128B);
+
+  init_tmap_2d_simple(&K_tmap, const_cast<nv_bfloat16*>(K_ptr), /*global_height=*/KV_height,
+                      /*global_width=*/HEAD_DIM,
+                      /*shared_height=*/BLOCK_N, /*shared_width=*/SW128_ATOM_COLS,
+                      CU_TENSOR_MAP_SWIZZLE_128B);
+
+  init_tmap_2d_simple(&V_tmap, const_cast<nv_bfloat16*>(V_ptr), /*global_height=*/KV_height,
+                      /*global_width=*/HEAD_DIM,
+                      /*shared_height=*/SW128_ATOM_ROWS, /*shared_width=*/SW128_ATOM_COLS,
+                      CU_TENSOR_MAP_SWIZZLE_128B);
+
+  const int total_work_items = bs * (len_q / q_stage::ROWS_PER_WORK_ITEM);
+
+  int device = 0;
+  int sm_count = 0;
+  check_cuda(cudaGetDevice(&device));
+  check_cuda(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
+  const int persistent_grid = sm_count * PERSISTENT_CTAS_PER_SM;
+  const int grid = (total_work_items < persistent_grid) ? total_work_items : persistent_grid;
+  const size_t smem_bytes =
+      size_t(q_stage::STAGES * Q_TILE_BYTES + kv_ring::STAGES * KV_TILE_BYTES);
+
+  if (smem_bytes > 48 * 1024) {
+    check_cuda(cudaFuncSetAttribute(attention_tcgen05_v16_kernel,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    int(smem_bytes)));
+  }
+
+  attention_tcgen05_v16_kernel<<<grid, TB_SIZE, smem_bytes, stream>>>(
+      Q_tmap, K_tmap, V_tmap, O_ptr, len_q, len_kv, total_work_items);
+  check_cuda(cudaGetLastError());
+}
