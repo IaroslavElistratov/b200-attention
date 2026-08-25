@@ -4,6 +4,12 @@ This repo targets Linux x86-64 with an NVIDIA B200 and the CUDA 12.8 toolkit.
 You also need `git`, `uv`, and a C++ compiler. The setup script creates a
 Python 3.12 environment. The model files use about 72 GB of disk space.
 
+Run all commands below from the capstone directory in the top-level checkout:
+
+```bash
+cd b200-attention/capstone-project
+```
+
 ## 1. Set up the environment
 
 ```bash
@@ -47,9 +53,10 @@ The command writes the MP4 and a same-name JSON report. It stops with an error
 if the custom kernel does not handle every expected attention call or if the
 final latent contains NaN or Inf values.
 
-## 5. Test a replacement kernel
+## 5. Test a kernel change
 
-After changing `kernel/20_deferred_wait.cu`, rebuild and run the B200 tests:
+After changing `../kernels/5_minor/18_tma_l2_promotion.cu`, rebuild and run the
+B200 tests:
 
 ```bash
 .venv/bin/ltx-sm100 build

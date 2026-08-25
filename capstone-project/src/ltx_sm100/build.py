@@ -19,9 +19,15 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _canonical_kernel_directory() -> Path:
+    return _project_root().parent / "kernels"
+
+
 def _kernel_sources() -> tuple[Path, Path]:
-    kernel_dir = _project_root() / "kernel"
-    return kernel_dir / "binding.cpp", kernel_dir / "20_deferred_wait.cu"
+    return (
+        _project_root() / "kernel" / "binding.cpp",
+        _canonical_kernel_directory() / "5_minor" / "18_tma_l2_promotion.cu",
+    )
 
 
 def default_build_directory() -> Path:
@@ -75,7 +81,14 @@ def build_extension(
             return _LOADED_LIBRARY
 
         sources = _kernel_sources()
-        missing = [str(source) for source in sources if not source.is_file()]
+        kernel_directory = _canonical_kernel_directory()
+        required_files = (
+            *sources,
+            kernel_directory / "common.cuh",
+            kernel_directory / "approximations.cuh",
+            kernel_directory / "smem_layout_swizzle128.cuh",
+        )
+        missing = [str(path) for path in required_files if not path.is_file()]
         if missing:
             raise FileNotFoundError(f"Missing SM100 extension source files: {', '.join(missing)}")
 
@@ -102,7 +115,7 @@ def build_extension(
                 sources=[str(source) for source in sources],
                 extra_cflags=["-O3", "-std=c++17"],
                 extra_cuda_cflags=["-O3", "-std=c++17"],
-                extra_include_paths=[str(sources[0].parent)],
+                extra_include_paths=[str(kernel_directory)],
                 extra_ldflags=["-lcuda"],
                 build_directory=str(output_dir),
                 verbose=verbose,

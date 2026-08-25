@@ -2,7 +2,8 @@
 
 ![Video samples generated with the B200 attention kernel](assets/heading.png)
 
-This repo contains the integration of our final kernel from the article
+This repo integrates the
+[`final kernel`](../kernels/5_minor/18_tma_l2_promotion.cu) from the article
 (a dense BF16 attention kernel for NVIDIA B200) into the LTX-2.3
 video-generation model.
 
@@ -20,17 +21,16 @@ I highly recommend doing it; you will get a kick seeing the kernel you understan
 **Your time is better spent understanding the article + diagrams + kernel code.**
 **This repo is just the plumbing for integrating our kernel into a video-generation model and running it.**
 **The focus of my article is optimizing a dense attention kernel for B200, so I do not want to spend time covering the plumbing code.**
-**The only thing worth understanding here is the kernel itself and its optimizations (`kernel/`), which I already explained in the article.**
+**The only thing worth understanding here is the kernel itself and its optimizations (`../kernels/`), which I already explained in the article.**
 **Everything else in this repo is just plumbing/glue code.**
 
 Basically:
 
-0. Rent the compute, SSH into the machine, and clone this repo.
-1. Paste your chosen article kernel into `kernel/20_deferred_wait.cu`. If its
-   launcher name differs from the final kernel, update `kernel/binding.cpp` too.
-2. Tell your LLM to set up this repo using the reproduction instructions (it
+0. Rent the compute, SSH into the machine, clone this repo, and enter
+   `b200-attention/capstone-project`.
+1. Tell your LLM to set up the capstone using the reproduction instructions (it
    will download the model weights, create the environment, and so on).
-3. When it's done, run the model—and out come the videos!
+2. When it's done, run the model—and out come the videos!
 
 ---
 

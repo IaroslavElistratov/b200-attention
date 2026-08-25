@@ -20,7 +20,7 @@ using AttentionFn = void(
     int key_value_length,
     cudaStream_t stream);
 
-AttentionFn attention_tcgen05_v20_launch;
+AttentionFn attention_tcgen05_v18_launch;
 
 namespace {
 
@@ -86,7 +86,7 @@ at::Tensor attention(
 
   auto output = at::empty_like(query);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream(query.get_device()).stream();
-  attention_tcgen05_v20_launch(
+  attention_tcgen05_v18_launch(
       reinterpret_cast<const nv_bfloat16*>(query.data_ptr()),
       reinterpret_cast<const nv_bfloat16*>(key.data_ptr()),
       reinterpret_cast<const nv_bfloat16*>(value.data_ptr()),

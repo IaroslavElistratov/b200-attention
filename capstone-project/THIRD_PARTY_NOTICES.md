@@ -1,6 +1,6 @@
 # Third-party notices
 
-The original code in this repository is licensed under Apache-2.0. The
+The original capstone integration code is licensed under Apache-2.0. The
 following components retain their own terms and attribution.
 
 ## LTX-2
@@ -15,7 +15,7 @@ Copyright (c) Lightricks Ltd. All rights reserved.
 
 ## NVIDIA CUTLASS
 
-`kernel/common.cuh` contains low-level device helper code adapted from NVIDIA
+`../kernels/common.cuh` contains low-level device helper code adapted from NVIDIA
 CUTLASS 4.2.1 and 4.3.1. CUTLASS is distributed under the BSD 3-Clause
 License in `LICENSES/CUTLASS-BSD-3-Clause.txt`.
 
@@ -23,7 +23,8 @@ Copyright (c) 2017–2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 ## FlashAttention
 
-`kernel/20_deferred_wait.cu` and `kernel/approximations.cuh` retain comments
+`../kernels/5_minor/18_tma_l2_promotion.cu` and
+`../kernels/approximations.cuh` retain comments
 identifying scheduling and approximation techniques associated with
 FlashAttention-4. This notice is retained conservatively for those portions.
 The FlashAttention BSD 3-Clause License is
