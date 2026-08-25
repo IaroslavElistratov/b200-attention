@@ -11,6 +11,7 @@ study the explanation and diff the neighboring source files.
 
 [**Read the visual guide**](https://iaroslavelistratov.github.io/b200-attention/) |
 [**Browse the kernels**](kernels/) |
+[**Check and benchmark**](benchmarks/) |
 [**Run the capstone**](capstone-project/)
 
 ## Read the visual guide
