@@ -1,4 +1,4 @@
-# Setup and generation
+# Getting started
 
 This repo targets Linux x86-64 with an NVIDIA B200 and the CUDA 12.8 toolkit.
 You also need `git`, `uv`, and a C++ compiler. The setup script creates a

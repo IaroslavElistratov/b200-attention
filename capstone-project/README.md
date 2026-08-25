@@ -17,21 +17,15 @@ Runtime depends on the complete model architecture, not only on our kernel.
 
 I highly recommend doing it; you will get a kick seeing the kernel you understand generate beautiful videos for you.
 
-**Don't bother reading the video-model integration manually.**
+**You do not need to study the video-model integration.**
 **Your time is better spent understanding the article + diagrams + kernel code.**
 **This repo is just the plumbing for integrating our kernel into a video-generation model and running it.**
 **The focus of my article is optimizing a dense attention kernel for B200, so I do not want to spend time covering the plumbing code.**
 **The only thing worth understanding here is the kernel itself and its optimizations (`../kernels/`), which I already explained in the article.**
 **Everything else in this repo is just plumbing/glue code.**
 
-Basically:
+To run the capstone:
 
-0. Rent the compute, SSH into the machine, clone this repo, and enter
+1. Rent the compute, SSH into the machine, clone this repo, and enter
    `b200-attention/capstone-project`.
-1. Tell your LLM to set up the capstone using the reproduction instructions (it
-   will download the model weights, create the environment, and so on).
-2. When it's done, run the model—and out come the videos!
-
----
-
-Reproduction instructions: [REPRODUCIBILITY.md](REPRODUCIBILITY.md)
+2. Follow the [setup and generation instructions](GETTING_STARTED.md).
