@@ -2,6 +2,7 @@
 
 [![B200 Attention from Scratch](assets/b200-attention-social-card.png)](https://iaroslavelistratov.github.io/b200-attention/)
 
+
 **14 kernels | 60 diagrams | 94.5% of stock FlashAttention-4**
 
 A visual, diffable path from scratch to a high-performance NVIDIA B200 kernel.
