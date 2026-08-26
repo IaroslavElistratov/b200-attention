@@ -1,7 +1,15 @@
 
-# B200 Attention from Scratch
+<h1 align="center">B200 Attention from Scratch</h1>
 
-**14 kernels | 60 diagrams | 94.5% of FlashAttention-4 | video-generation capstone**
+<p align="center">
+<em>Build and understand one of the most complex GPU kernels, on the latest hardware.</em>
+</p>
+
+<p align="center">
+14 kernels · 60 diagrams · 94.5% of FlashAttention-4 · Video-generation capstone
+</p>
+
+
 
 <!-- <h1 align="center">
 <a href="https://iaroslavelistratov.github.io/b200-attention/">🎨 Read visual guide</a> ·
@@ -20,18 +28,17 @@
 </h2>
 
 
+
+
 [![B200 Attention from Scratch](assets/b200-attention-social-card.png)](https://iaroslavelistratov.github.io/b200-attention/)
 
-
-
-
-
-**Build and understand one of the most complex GPU kernels on the latest hardware.**
+**Build and understand one of the most complex GPU kernels, on the latest hardware.**
 
 A visual, diffable path from scratch to a high-performance NVIDIA B200 kernel.
 Each checkpoint is organized around one main optimization, so you can
 study the explanation and diff the neighboring source files.
 
+**If you are familiar with basic cuda, you can read and fully understand the blogpost.**
 The visual guide introduces Blackwell-specific machinery gradually, with
 step-by-step explanations and diagrams. Basic CUDA and matrix-multiplication
 familiarity are enough; no prior Blackwell experience is required.
@@ -40,8 +47,6 @@ familiarity are enough; no prior Blackwell experience is required.
 [super visual article](https://iaroslavelistratov.github.io/b200-attention/).**
 The diagrams, explanations, and source are designed to be read together rather
 than reading `.cu` files standalone.
-
-**If you are familiar with basic cuda, you can read and fully understand the blogpost.**
 
 ## Performance progression
 
