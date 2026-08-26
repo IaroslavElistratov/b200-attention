@@ -36,6 +36,11 @@ The visual guide introduces Blackwell-specific machinery gradually, with
 step-by-step explanations and diagrams. Basic CUDA and matrix-multiplication
 familiarity are enough; no prior Blackwell experience is required.
 
+**I strongly recommend following the kernels alongside the
+[super visual article](https://iaroslavelistratov.github.io/b200-attention/).**
+The diagrams, explanations, and source are designed to be read together rather
+than reading `.cu` files standalone.
+
 **If you are familiar with basic cuda, you can read and fully understand the blogpost.**
 
 ## Performance progression
