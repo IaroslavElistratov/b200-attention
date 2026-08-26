@@ -28,8 +28,11 @@ Substitute any neighboring pair in the numbered lineage.
 
 ## Shared helpers
 
-The reusable pieces shared by multiple checkpoints live at the root of this
-directory. Not every kernel uses every helper:
+The `.cuh` files are simply for code reused by multiple kernels. If an
+optimization introduced in one checkpoint is kept by later checkpoints, I put
+the shared functions in a `.cuh` header instead of copying them into every later
+`.cu` file. Earlier kernels do not start using helpers introduced later, so not
+every kernel uses every header or every helper:
 
 - `common.cuh` contains shared mbarrier, TMA, `tcgen05`, descriptor, and packing
   primitives.
