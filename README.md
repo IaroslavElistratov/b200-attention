@@ -60,7 +60,7 @@ than reading `.cu` files standalone.
 
 ## Capstone: generate videos with the kernel you now understand
 
-<!-- <video controls muted src="assets/videos/custom19_eight_up_1536x512_github_readme.mp4"></video> -->
+<!-- <video controls muted src="assets/videos/b200-attention-capstone-demo.mp4"></video> -->
 https://github.com/user-attachments/assets/7c30297f-a555-4e4d-923d-d3a8b6defabc
 
 
