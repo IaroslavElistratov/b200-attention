@@ -10,16 +10,6 @@
 </p>
 
 
-
-<!-- <h1 align="center">
-<a href="https://iaroslavelistratov.github.io/b200-attention/">🎨 Read visual guide</a> ·
-<a href="kernels/">⚙️ Browse kernels</a> ·
-<a href="capstone-project/">🚀 Run capstone</a> ·
-<br>
-<a href="benchmarks/">📊 Benchmark</a>
-</h1> -->
-
-
 <h2 align="center">
   <a href="https://iaroslavelistratov.github.io/b200-attention/">🎨 Read visual guide</a> ·
   <a href="kernels/">⚙️ Browse kernels</a> ·
@@ -88,11 +78,12 @@ The kernels implement dense, non-causal forward attention for NVIDIA B200
 lengths that are multiples of 128 (up to 32K seq_len tested, likely will work fine for even longer),
 and Q lengths compatible with each checkpoint's one- or two-tile Q staging.
 
-This is a handwritten teaching and research lineage,
-not a line-for-line port of the official FlashAttention-4
+I developed and refined this handwritten CUDA/PTX lineage over a couple of
+months. Every line is deliberate and understood. It is designed for teaching
+and research, not as a line-for-line port of the official FlashAttention-4
 implementation.
 
-## Stay in touch for more ML systems
+# Stay in touch for more ML systems
 
 A video walkthrough of the code is coming.
 
