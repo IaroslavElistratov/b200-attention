@@ -29,8 +29,8 @@ See [Benchmark calibration](https://iaroslavelistratov.github.io/b200-attention/
 | 17 | Phase bitmasks | 93.7% | 94.0% | 94.1% |
 | 18 | TMA L2 promotion | 94.4% | 94.4% | 94.1% |
 
-These scripts compile the numbered kernels on a Modal B200. Run all commands
-from the repository root after installing and authenticating the Modal client:
+The included scripts use Modal for B200 access, but any other cloud provider
+with B200s works too. Run the commands below from the repository root:
 
 ```bash
 python -m pip install modal

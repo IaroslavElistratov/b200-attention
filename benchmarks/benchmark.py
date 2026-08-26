@@ -172,6 +172,7 @@ def _dense_forward_flops(
     return 4 * batch * heads * len_q * len_kv * HEAD_DIM
 
 
+# Modal only provides the remote B200; the same benchmark can run on any B200 provider.
 @app.function(gpu="B200", timeout=60 * 10)
 def benchmark_remote(kernel: str, shape: str, arm_order: str):
     import flash_attn
