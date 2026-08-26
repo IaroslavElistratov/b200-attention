@@ -1,18 +1,33 @@
 # B200 Attention from Scratch
 
+**14 kernels | 60 diagrams | 94.5% of FlashAttention-4 | video-generation capstone**
+
+
 [![B200 Attention from Scratch](assets/b200-attention-social-card.png)](https://iaroslavelistratov.github.io/b200-attention/)
 
+<h2 align="center">
+  <a href="https://iaroslavelistratov.github.io/b200-attention/">🎨 Read visual guide</a> ·
+  <a href="kernels/">⚙️ Browse kernels</a> ·
+  <a href="benchmarks/">📊 Check &amp; benchmark</a> ·
+  <a href="capstone-project/">🚀 Run capstone</a>
+</h2>
+<!-- 
+<h1 align="center">
+  <a href="https://iaroslavelistratov.github.io/b200-attention/">🎨 Read visual guide</a> ·
+  <a href="kernels/">⚙️ Browse kernels</a>
+</h1>
 
-**14 kernels | 60 diagrams | 94.5% of stock FlashAttention-4**
+<h1 align="center">
+  <a href="benchmarks/">📊 Check &amp; benchmark</a> ·
+  <a href="capstone-project/">🚀 Run capstone</a>
+</h1> -->
+
+**Build and understand one of the most complex GPU kernels on the latest hardware.**
 
 A visual, diffable path from scratch to a high-performance NVIDIA B200 kernel.
 Each checkpoint is organized around one main optimization, so you can
 study the explanation and diff the neighboring source files.
 
-[**Read the visual guide**](https://iaroslavelistratov.github.io/b200-attention/) |
-[**Browse the kernels**](kernels/) |
-[**Check and benchmark**](benchmarks/) |
-[**Run the capstone**](capstone-project/)
 
 ## Read the visual guide
 

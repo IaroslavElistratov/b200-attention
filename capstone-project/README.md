@@ -1,4 +1,4 @@
-# B200 FlashAttention for LTX-2.3
+# Video-Generation Capstone (using our B200 Attention)
 
 ![Video samples generated with the B200 attention kernel](assets/heading.png)
 
