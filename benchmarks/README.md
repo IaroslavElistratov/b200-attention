@@ -18,7 +18,7 @@ label. The supported benchmark shapes are `paper4k`, `paper8k`, and
 modal run benchmarks/check_correctness.py --kernel 18 --shape paper4k
 ```
 
-The input order follows Dao's
+The input order follows FA4's
 [`benchmark_attn.py`](https://github.com/Dao-AILab/flash-attention/blob/main/benchmarks/benchmark_attn.py)
 for the dense, non-causal, BF16, head-dimension-128 case implemented here: seed
 `0`, followed by sequential BF16 `torch.randn` Q/K/V generation. The selected
@@ -32,19 +32,54 @@ modal run benchmarks/benchmark.py \
   --kernel 18 --shape paper4k --arm-order fa4_first
 ```
 
-One invocation measures exactly one local kernel and stock FlashAttention-4 on
-one shape using this timing window:
+### Input layout and direct BSHD
+
+The numbered lineage benchmarks time each implementation on its native
+contiguous layout:
 
 ```text
-one-second pause before each arm
-triton.testing.do_bench(warmup=5, rep=10, return_mode="mean")
+Stock FA4:    BSHD [B, L, H, D]
+Local kernel: BHLD [B, H, L, D]
 ```
 
-The output reports milliseconds, TFLOPS, percentage of same-run stock FA4, and
-percentage of the corresponding FA4 paper result.
+Layout preparation is outside the timed region for both implementations.
 
-A stable comparison uses six fresh invocations per kernel and shape, balanced
-by order:
+I also implemented a
+[direct-BSHD version of Kernel 18](../kernels/variants/18_tma_l2_promotion_bshd.cu).
+It receives and returns contiguous BSHD without any layout conversions.
+The same modification can be straightforwardly applied to any of the other kenrles in the lineage.
+Only the global-memory indexing changes:
+
+```cpp
+// Native BHLD
+tmap = [B * H * L, D];
+x = feature;
+y = batch_head * L + row;
+
+// Direct BSHD
+tmap = [B * L, H * D];
+x = head * D + feature;
+y = batch * L + row;
+```
+
+TMA still writes tiles into the same SW128 SMEM layouts (as discussed in the blog).
+And all optimizations we covered in the blog remain unchanged.
+
+B200 runs per shape produced these median same-run perf:
+
+| Shape | Native BHLD | Direct BSHD | Direct-BSHD latency cost |
+|---|---:|---:|---:|
+| 4K | `94.51%` of FA4 | `92.07%` of FA4 | `2.65%` |
+| 8K | `94.65%` of FA4 | `92.69%` of FA4 | `2.14%` |
+| 16K | `93.87%` of FA4 | `92.12%` of FA4 | `1.92%` |
+
+The lineage plot uses native-layout timings. The direct-BSHD measurements use
+the same contiguous input/output layout as FA4 and include no conversion copies.
+
+### Getting stable numbers
+
+One command compares one local kernel with stock FA4 on one shape.
+To smooth out cloud timing noise, run each order 3-6 times:
 
 ```bash
 for run in 1 2 3; do
@@ -55,8 +90,4 @@ for run in 1 2 3; do
 done
 ```
 
-Take the median of the six full-precision `percent_stock_fa4` values. Do not
-use a ratio of separately aggregated timings. Also compare the two order-specific
-medians; if they differ by at least one percentage point, collect more runs or
-report the order sensitivity. Do not treat one short-burst invocation as a
-stable performance result.
+Use the median of all reported `percent_stock_fa4` values.

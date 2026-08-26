@@ -238,6 +238,8 @@ def benchmark_remote(kernel: str, shape: str, arm_order: str):
         tensor.detach().to(torch.bfloat16).requires_grad_(False)
         for tensor in (q, k, v)
     ]
+    # The numbered lineage materializes native BHLD here. Direct-BSHD Kernel 18
+    # skips these copies; see benchmarks/README.md#input-layout-and-direct-bshd.
     q_local, k_local, v_local = tuple(
         tensor.transpose(1, 2).contiguous() for tensor in (q, k, v)
     )

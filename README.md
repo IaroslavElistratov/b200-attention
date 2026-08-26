@@ -29,10 +29,21 @@ CUDA and matrix-multiplication familiarity.
 
 ![Performance across the B200 attention kernel lineage](assets/results_condensed_context_pct_stock_fa4.png)
 
+> Benchmark scope: FA4 and my kernels are benchmarked on their preferred layouts.
+> FA4 contiguous on BSHD, and the local kernels on contiguous BHLD.
+> Layout conversion was excluded from timing for both.
+>
+> Also, the local kernels can be easily adapted to natively work on FA4-style BSHD
+> (without calling .contiguous() on the inputs).
+> I implemented a direct-BSHD version of the final kernel (same modification can be applied
+> to any other kernel in the lineage), performance changes only slightly.
+> See benchmarks/README.md#input-layout-and-direct-bshd.
+
+
 ## Kernel lineage
 
 - [`kernels/`](kernels/) - 18 numbered checkpoints: 14 main stages followed by
-  four smaller optional refinements.
+  four smaller optional refinements, plus a direct-BSHD integration variant.
 
 ## Capstone: generate videos with your kernel
 

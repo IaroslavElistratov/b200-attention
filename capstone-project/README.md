@@ -14,6 +14,10 @@ That is enough time to set up the repo, download the weights, and generate multi
 
 A 10.4-second video (249 frames) takes about 41 seconds to generate on a B200.
 Runtime depends on the complete model architecture, not only on our kernel.
+The current adapter physically converts Q, K, and V from the model's token-major
+layout to contiguous BHLD before every attention call, then converts the BHLD
+output back afterward. Those four layout copies are included in the 41-second
+full-model measurement.
 
 I highly recommend doing it; you will get a kick seeing the kernel you understand generate beautiful videos for you.
 

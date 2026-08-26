@@ -58,6 +58,19 @@ The published performance results use three square benchmark shapes:
 
 These are fixed teaching kernels rather than a general attention API.
 
+## Direct BSHD variants
+
+[`variants/1_baseline_bshd.cu`](variants/1_baseline_bshd.cu)
+is the smallest example of the layout change.
+[`variants/18_tma_l2_promotion_bshd.cu`](variants/18_tma_l2_promotion_bshd.cu)
+applies the same change to the final kernel.
+
+Both variants read and write contiguous BSHD directly while keeping the same
+SMEM/TMEM layouts and kernel schedules. All the optimizations covered in the
+blog remain unchanged. These files stay outside the numbered lineage because
+they change the global I/O contract rather than introduce another optimization.
+See [Input layout and direct BSHD](../benchmarks/README.md#input-layout-and-direct-bshd).
+
 ## Conservative Kernel 14 variant
 
 [`__14_persistent_conservative.cu`](4_persistent/__14_persistent_conservative.cu)
