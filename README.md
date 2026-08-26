@@ -2,7 +2,7 @@
 <h1 align="center">B200 Attention from Scratch</h1>
 
 <p align="center">
-<em>Build and understand one of the most complex GPU kernels, on the latest hardware.</em>
+<em>Build and understand one of the most complex GPU kernels on the latest hardware.</em>
 </p>
 
 <p align="center">
@@ -22,7 +22,7 @@
 
 [![B200 Attention from Scratch](assets/b200-attention-social-card.png)](https://iaroslavelistratov.github.io/b200-attention/)
 
-**Build and understand one of the most complex GPU kernels, on the latest hardware.**
+**Build and understand one of the most complex GPU kernels on the latest hardware.**
 
 A visual, diffable path from scratch to a high-performance NVIDIA B200 kernel.
 Each checkpoint is organized around one main optimization, so you can
