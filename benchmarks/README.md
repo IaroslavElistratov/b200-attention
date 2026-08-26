@@ -105,6 +105,16 @@ B200 runs per shape produced these median same-run perf:
 The lineage plot uses native-layout timings. The direct-BSHD measurements use
 the same contiguous input/output layout as FA4 and include no conversion copies.
 
+#### Run the BSHD comparison
+
+```bash
+modal run benchmarks/benchmark_bshd.py \
+  --shape paper4k --arm-order fa4_first
+```
+
+This checks correctness, then times stock FA4, direct BSHD, and native BHLD.
+The available orders are `fa4_first`, `bshd_first`, and `bhld_first`.
+
 ### Getting stable numbers
 
 One command compares one local kernel with stock FA4 on one shape.

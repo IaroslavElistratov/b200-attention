@@ -50,7 +50,7 @@ than reading `.cu` files standalone.
 > (without calling .contiguous() on the inputs).
 > I implemented a direct-BSHD version of the final kernel (same modification can be applied
 > to any other kernel in the lineage), performance changes only slightly.
-> See benchmarks/README.md#input-layout-and-direct-bshd.
+> See [Input layout and direct BSHD](benchmarks/README.md#input-layout-and-direct-bshd).
 
 
 ## Kernel lineage
