@@ -91,3 +91,17 @@ and Q lengths compatible with each checkpoint's one- or two-tile Q staging.
 This is a handwritten teaching and research lineage,
 not a line-for-line port of the official FlashAttention-4
 implementation.
+
+## Stay in touch for more ML systems
+
+A video walkthrough of the code is coming.
+
+📚 I'm also releasing a free e-book soon.
+
+More ML systems articles, videos, and code are coming. Follow on:
+
+[X](https://x.com/iaro_e) ·
+[LinkedIn](https://www.linkedin.com/in/iaroslav-elistratov/) ·
+[YouTube](https://www.youtube.com/@IaroslavElistratov) ·
+[GitHub](https://github.com/IaroslavElistratov) ·
+[Google Scholar](https://scholar.google.com/citations?user=PYpBRIkAAAAJ)
