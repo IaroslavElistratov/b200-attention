@@ -1,26 +1,30 @@
+
 # B200 Attention from Scratch
 
 **14 kernels | 60 diagrams | 94.5% of FlashAttention-4 | video-generation capstone**
 
+<!-- <h1 align="center">
+<a href="https://iaroslavelistratov.github.io/b200-attention/">🎨 Read visual guide</a> ·
+<a href="kernels/">⚙️ Browse kernels</a> ·
+<a href="capstone-project/">🚀 Run capstone</a> ·
+<br>
+<a href="benchmarks/">📊 Benchmark</a>
+</h1> -->
 
-[![B200 Attention from Scratch](assets/b200-attention-social-card.png)](https://iaroslavelistratov.github.io/b200-attention/)
 
 <h2 align="center">
   <a href="https://iaroslavelistratov.github.io/b200-attention/">🎨 Read visual guide</a> ·
   <a href="kernels/">⚙️ Browse kernels</a> ·
-  <a href="benchmarks/">📊 Check &amp; benchmark</a> ·
+  <a href="benchmarks/">📊 Benchmark</a> ·
   <a href="capstone-project/">🚀 Run capstone</a>
 </h2>
-<!-- 
-<h1 align="center">
-  <a href="https://iaroslavelistratov.github.io/b200-attention/">🎨 Read visual guide</a> ·
-  <a href="kernels/">⚙️ Browse kernels</a>
-</h1>
 
-<h1 align="center">
-  <a href="benchmarks/">📊 Check &amp; benchmark</a> ·
-  <a href="capstone-project/">🚀 Run capstone</a>
-</h1> -->
+
+[![B200 Attention from Scratch](assets/b200-attention-social-card.png)](https://iaroslavelistratov.github.io/b200-attention/)
+
+
+
+
 
 **Build and understand one of the most complex GPU kernels on the latest hardware.**
 
