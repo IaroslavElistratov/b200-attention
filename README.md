@@ -28,17 +28,11 @@ A visual, diffable path from scratch to a high-performance NVIDIA B200 kernel.
 Each checkpoint is organized around one main optimization, so you can
 study the explanation and diff the neighboring source files.
 
+The visual guide introduces Blackwell-specific machinery gradually, with
+step-by-step explanations and diagrams. Basic CUDA and matrix-multiplication
+familiarity are enough; no prior Blackwell experience is required.
 
-## Read the visual guide
-
-**[B200 Attention from Scratch](https://iaroslavelistratov.github.io/b200-attention/)**
-
-Article introduces Blackwell-specific machinery gradually, in
-**super visual** and step-by-step guide. It assumes basic
-CUDA and matrix-multiplication familiarity.
-
-**If you are familiar with basic cuda, you can read and fully understand this article.**
-**No experience with Blackwell is required to follow alone.**
+**If you are familiar with basic cuda, you can read and fully understand the blogpost.**
 
 ## Performance progression
 
