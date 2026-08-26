@@ -58,9 +58,11 @@ familiarity are enough; no prior Blackwell experience is required.
 - [`kernels/`](kernels/) - 18 numbered checkpoints: 14 main stages followed by
   four smaller optional refinements, plus a direct-BSHD integration variant.
 
-## Capstone: generate videos with your kernel
+## Capstone: generate videos with the kernel you now understand
 
-[![Videos generated with the B200 attention kernel](capstone-project/assets/heading.png)](capstone-project/)
+<video controls muted src="assets/videos/custom19_eight_up_1536x512_github_readme.mp4"></video>
+
+
 
 I strongly recommend doing the capstone after reading the article.
 It plugs the B200 attention kernel into a video generation model,
