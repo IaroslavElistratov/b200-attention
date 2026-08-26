@@ -1,5 +1,34 @@
 # Run the kernels
 
+Stock FA4 is 100%. Each value below is the median of six same-run ratios;
+every call timed the local kernel and stock FA4 on the same B200.
+Using the same-run ratio reduces cloud timing noise.
+
+I use same-run FA4 instead of the paper TFLOPS because, across 342 calibration runs,
+stock FA4 itself reached about 97% of the paper results on the B200s I used.
+See [Benchmark calibration](https://iaroslavelistratov.github.io/b200-attention/#benchmark-calibration).
+
+| Kernel | Change | 4K | 8K | 16K |
+|---:|---|---:|---:|---:|
+| 1 | Baseline | 14.2% | 14.1% | 13.7% |
+| 2 | P in TMEM | 15.1% | 15.0% | 15.0% |
+| 3 | Swizzling | 25.9% | 25.9% | 26.2% |
+| 4 | Warp specialization | 26.6% | 26.4% | 26.5% |
+| 5 | Two Q tiles | 40.5% | 40.3% | 41.3% |
+| 6 | Load pipeline | 48.6% | 48.6% | 48.4% |
+| 7 | Compute pipeline | 58.2% | 58.5% | 58.0% |
+| 8 | Hardware `exp2` | 64.1% | 64.1% | 63.8% |
+| 9 | Software `exp2` | 69.3% | 70.1% | 70.6% |
+| 10 | Register caching | 72.9% | 73.7% | 73.6% |
+| 11 | Skip O rescale | 81.7% | 83.0% | 83.3% |
+| 12 | Split correction | 84.9% | 85.8% | 86.3% |
+| 13 | Early PV | 87.2% | 88.1% | 88.4% |
+| 14 | Persistent CTAs | 90.7% | 90.3% | 89.8% |
+| 15 | Deferred score acquisition | 92.3% | 92.5% | 92.0% |
+| 16 | Split rowsum accumulation | 93.4% | 93.7% | 93.7% |
+| 17 | Phase bitmasks | 93.7% | 94.0% | 94.1% |
+| 18 | TMA L2 promotion | 94.4% | 94.4% | 94.1% |
+
 These scripts compile the numbered kernels on a Modal B200. Run all commands
 from the repository root after installing and authenticating the Modal client:
 
